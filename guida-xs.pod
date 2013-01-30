@@ -1,0 +1,703 @@
+=pod
+
+=head1 Anatomia di un modulo XS
+
+In questa guida, cercherò di spiegare, innanzitutto a me stesso
+e, se possibile, ad altri, come riuscire a capire la struttura e il
+il funzionamento di un modulo Perl XS.
+
+=head1 Cos'è XS
+
+XS è un linguaggio, o meglio un set di macro che servono a costruire
+automaticamente codice C collegato all'interprete Perl.
+Quanto automaticamente è argomento di discussione.
+
+=head1 Iniziare da zero
+
+Iniziando da zero, è necessario acquisire alcune conoscenze di base
+sui B<Perl Internals>, cioè sul come funziona l'interprete Perl dall'interno
+e su quali sono le principali strutture dati che esso espone.
+
+In seguito, si potrà tentare la lettura e comprensione di un modulo XS
+già fatto, magari uno semplice. :)
+
+I dettagli sono di una vastità sconcertante, quindi il consiglio è quello
+di concentrarsi su esempi semplici, per capire i concetti di base.
+
+=head1 L'interprete perl
+
+L'interprete è un programma in C. Come tale, utilizza delle
+strutture C (struct) per immagazzinare le variabili che poi sono rese
+disponibili come tipi di dato in Perl.
+
+Inoltre, B<perl è un interprete stack-based>. Ai nostri fini, questo
+significa che le chiamate tra C e Perl devono passare i propri argomenti
+sullo stack. Non si tratta dello stack a cui fa riferimento la CPU,
+ma del B<Perl Stack>, gestito internamente dall'interprete.
+
+Altra caratteristica peculiare di perl è che è pesantemente basato
+su macro, almeno per tre motivi:
+
+=over
+
+=item estrema portabilità
+
+=item complessità di gestione interna
+
+=item compatibilità all'indietro con versioni arcaiche
+
+=back
+
+=head1 Tipi di dato
+
+I tipi di dato più comuni sono:
+
+=over
+
+=item scalari (C<SV> = scalar value)
+
+=item array (C<AV> = array value)
+
+=item hash (C<HV> = hash value)
+
+=item code (C<CV> = code value)
+
+=item glob (C<GV> = glob value)
+
+=back
+
+Altri tipi dato accessori, sono:
+
+=over
+
+=item I32
+
+signed integer 32 bit, platform independent
+
+=item U32
+
+unsigned integer 32 bit, platform independent
+
+=item STRLEN
+
+string length, qualsiasi lunghezza di una stringa lecita
+
+=back
+
+
+=head2 Scalari (SV)
+
+Gli scalari in particolare sono il tipo di dato più potente e flessibile,
+che contiene diverse meta-informazioni sul suo contenuto, utili all'interprete
+per ottimizzazioni e conversioni al volo.
+
+La struttura C che definisce un SV è simile alla seguente:
+
+  struct STRUCT_SV {        /* struct sv { */
+      void*    	sv_any;     /* pointer to something */
+      U32       sv_refcnt;	/* how many references to us */
+      U32       sv_flags;	/* what we are */
+  };
+
+Gli SV possono essere di molti tipi. I più importanti nel nostro caso sono:
+
+=over
+
+=item C<SVIV>
+
+IV = integer value, numeri interi
+
+=item C<SVUV>
+
+UV = unsigned value, interi unsigned
+
+=item C<SVNV>
+
+NV = numeric value, valori floating point
+
+=item C<SVPV>
+
+PV = stringhe
+
+=item C<SVRV>
+
+RV = reference
+
+=back
+
+Di questi tipi, C<SVRV> è particolare perché implementa i reference
+ad altri tipi di scalari. Diverse macro e API Perl riguardano l'uso
+e la dereferenziazione di C<SVRV>.
+
+=head2 Array (AV)
+
+L'array, C<AV>, è decisamente il tipo più semplice da gestire, esattamente
+come si fa da Perl. Ogni elemento di un C<AV> è un C<SV>.
+
+=head2 Hash (HV)
+
+L'hash è chiamato C<HV>.
+La sua gestione è molto semplice. L'hash è una lista di C<HE> (hash entry).
+Ogni C<HE> contiene una chiave (C<HK>) e un valore (un C<SV>).
+
+          .----.---.    .----.---. 
+   *HV -> | HE | * | -> | HE | * | ->  . . .
+          '----'---'    '----'---'
+            |             |      
+            v             v
+          .----.----.   .----.----.
+          | HK | SV |   | HK | SV |
+          '----'----'   '----'----'
+
+Alcune funzioni e macro implementano in poche istruzioni l'iterazione,
+la ricerca e l'inserimento di valori in un hash.
+
+
+=head1 API Perl
+
+=head2 Nomenclatura
+
+Le regole base:
+
+=over
+
+=item Le macro hanno l'iniziale maiuscola
+
+Esempio: C<SvLEN()>, C<SPAGAIN>
+
+=item Le funzioni sono in style underscore-delimited
+
+Esempio: C<sv_catpvn()>
+
+=item I tipi di dato sono scritti in maiuscolo
+
+Esempio: C<SV*>, C<I32>, C<U32>
+
+=item Ogni funzione ha un prefisso e-o un suffisso relativo ai tipi di dato su cui opera.
+
+=back
+
+
+=head2 Altri esempi
+
+    /* Creazione di uno scalare vuoto, non tipizzato */
+    SV* mysv = newSV();
+
+    /* Append della stringa "blabla" in mysv */
+    sv_catpvn(mysv, "blabla", 6);
+
+In questo caso, C<newSV()> crea un nuovo scalare vuoto non inizializzato.
+Dalla seconda funzione, C<sv_catpvn()> si puo' dedurre che:
+
+=over
+
+=item è scritta in minuscolo, quindi è appunto una funzione
+
+=item inizia con C<sv_>, quindi opera su scalari (SV)
+
+=item contiene C<cat>, quindi somiglia a C<strcat> del C
+
+=item con C<pv> si intende una stringa di caratteri (vedi C<SVPV>)
+
+=item C<n> come ultimo carattere significa che la lunghezza della stringa fornita come argomento deve essere specificata manualmente, esattamente come in C.
+
+=back
+
+Dovrebbe essere abbastanza semplice ora capire che cosa fa questa
+funzione, cioè appende una stringa passata come argomento ad uno
+scalare pre-esistente. Il numero dei caratteri copiati è specificato
+come secondo argomento.
+
+Altro esempio:
+
+    /* Search for our attribute name in flags */
+    for (i = 0; i <= av_len(flaglist); i++) {
+
+        SV* flag_name_sv;
+        SV** rsv = av_fetch(flaglist, i, 0);
+        if (! rsv) continue;
+
+        /* If attribute name is in the array, it is a flag */
+        flag_name_sv = *rsv;
+
+        if (SvOK(flag_name_sv) && SvPVX(flag_name_sv))
+            if (strEQ(attr_nam, SvPVX(flag_name_sv)))
+                return 1;
+    }
+
+Le funzioni e macro usate qui sono:
+
+=over
+
+=item av_len(av)
+
+Funzione, torna la lunghezza di un array
+
+=item av_fetch(av, n, 0)
+
+Funzione, ritorna un C<SV**> (puntatore a puntatore di SV)
+relativo all'elemento C<n> dell'array C<av>. Lasciamo perdere lo zero per ora...
+
+=item SvOK(sv)
+
+Una macro, serve per controllare se il puntatore passato è
+uno scalare oppure no, e se è definito oppure no
+
+=item SvPVX(sv)
+
+Macro, ritorna il puntatore C<char*> di uno scalare C<SVPV>.
+Serve per accedere direttamente alla stringa contenuta nello scalare.
+
+=item strEQ()
+
+Funzione, compara stringhe (C<char*>) per uguaglianza.
+
+=back
+
+
+=head2 Funzioni e macro più importanti
+
+Questa è una lista, ovviamente parziale, delle funzioni e macro
+generalmente più usate, almeno da me. Con C<sv>, C<av> e C<hv>
+indico dei puntatori generici ai tipi C<SV>, C<AV> e C<HV>.
+
+=head3 SvLEN(sv)
+
+Torna la lunghezza dello scalare puntato da C<sv>.
+
+=head3 SvOK(sv)
+
+Ritorna un boolean. Indica se C<sv> è uno scalare "definito". Per definito
+si intende che non sia garbage-collected (cioè già marcato come riutilizzabile
+dal garbage-collector), nullo o non definito.
+
+=head3 SvROK(sv)
+
+Ritorna un boolean. Indica se lo scalare C<sv> è un reference (SVRV).
+SV = scalar value. R = reference. OK = OK.
+
+=head3 SvRV(sv)
+
+Dereferenzia lo scalare C<sv>, che deve contenere un SVRV, cioè
+un reference e restituisce lo scalare a cui C<sv> punta.
+Per testare che C<sv> sia effettivamente un reference, si usa C<SvROK(sv)>.
+
+=head3 SvPV(sv), SvPVX(sv)
+
+Restituisce il puntatore alla stringa di testo contenuta nello scalare.
+Lo scalare deve essere un C<SVPV>. Se non lo è, viene automaticamente
+convertito.
+
+=head3 SvTYPE(sv)
+
+Torna il tipo di uno scalare. I tipi sono definiti nei sorgenti del Perl,
+in "sv.h" e sono:
+
+	SVt_NULL,	/* 0 */
+	SVt_IV,		/* 1 */
+	SVt_NV,		/* 2 */
+	SVt_RV,		/* 3 */
+	SVt_PV,		/* 4 */
+	SVt_PVIV,	/* 5 */
+	SVt_PVNV,	/* 6 */
+	SVt_PVMG,	/* 7 */
+	SVt_PVBM,	/* 8 */
+	SVt_PVLV,	/* 9 */
+	SVt_PVAV,	/* 10 */
+	SVt_PVHV,	/* 11 */
+	SVt_PVCV,	/* 12 */
+	SVt_PVGV,	/* 13 */
+	SVt_PVFM,	/* 14 */
+	SVt_PVIO	/* 15 */
+
+Dove C<SVt> significa SV type, e i reference ordinari, cioè quelli che puntano
+a AV e HV, sono identificati dai tipi C<SVt_PVAV> e C<SVt_PVHV>. Non so perché PV,
+invece di RV, che suonerebbe più normale.
+
+=head3 sv_catsv(dest, src)
+
+Appende il contenuto di uno scalare C<src> in un altro scalare C<dest>
+
+=head3 sv_catpv(sv, str)
+
+=head3 sv_catpvn(sv, str, len)
+
+Appende una stringa C<str> (con opzionalmente la lunghezza C<len>)
+in uno scalare C<sv>.
+
+=head1 Costruire un modulo XS
+
+In genere un modulo XS non si scrive mai da zero, ma prendendo uno già
+esistente e modificandolo. Questa pero' non sarebbe la soluzione ottimale,
+che invece consiste nell'uso di C<h2xs>.
+
+=head2 h2xs
+
+C<h2xs> è uno script perl presente nella distribuzione standard del Perl
+che consente di "partire" da zero con un modulo Perl, con XS o senza,
+in modo che questo aderisca esattamente a tutti i criteri più standard,
+funzioni su più piattaforme, ...
+
+Esempio di utilizzo. Creiamo il modulo "string", da zero.
+
+    $ h2xs -O -b 5.6.1 -f string
+    Writing String/ppport.h
+    Writing String/lib/String.pm
+    Writing String/String.xs
+    Writing String/fallback/const-c.inc
+    Writing String/fallback/const-xs.inc
+    Writing String/Makefile.PL
+    Writing String/README
+    Writing String/t/String.t
+    Writing String/Changes
+    Writing String/MANIFEST
+
+Le opzioni aggiuntive servono per iniziare senza il codice C
+già pronto da interfacciare, e per garantire compatibilità
+del modulo all'indietro con perl 5.6.1.
+
+La documentazione completa di C<h2xs> è accessibile come sempre
+con C<perldoc h2xs>.
+
+=head2 Compilazione e installazione del modulo
+
+La compilazione e l'installazione di un modulo XS seguono la
+stessa procedura per qualsiasi altro modulo Perl.
+
+    perl Makefile.PL
+    make
+    make test
+    sudo make install
+
+Durante la fase di "make", il codice XS verrà espanso in codice C
+e compilato con lo stesso compilatore e stesse opzioni di compilazione
+(CFLAGS, ottimizzazioni, ...) usate per l'interprete perl stesso.
+
+La procedura di installazione (C<make install>) installa anche la
+libreria dinamica prodotta dal compilatore, in questo caso
+C<String.so> oppure C<String.dll> nel sottoalbero
+C<< site_perl/<arch>/auto/String/String.so >>.
+
+Se non c'è nessun compilatore configurato, oppure questo è
+diverso da quello utilizzato per compilare l'interprete in
+origine, non sarà possibile compilare il nuovo modulo,
+oppure questo non funzionerà una volta installato.
+
+=head1 Struttura del codice XS
+
+Un file .xs è diviso idealmente in tre sezioni:
+
+=over
+
+=item intestazione, sempre presente
+
+=item codice C puro, puo' non esserci
+
+=item codice XS
+
+=back
+
+Come detto, il file .xs viene prima processato attraverso lo script C<xsubpp>,
+trasformato da questo in codice C, e poi compilato e linkato con l' "eseguibile"
+perl (il file CORE.lib) per generare una libreria dinamica (.so, .dll, ...).
+
+I commenti possono essere inclusi come in C:
+
+    /* Commento */
+    // Altro commento
+
+=head2 Intestazione
+
+Consiste nelle seguenti righe:
+
+    #include "EXTERN.h"
+    #include "perl.h"
+    #include "XSUB.h"
+
+Questi tre file include sono *sempre* presenti, non importa cosa il modulo
+debba fare.
+
+=head2 Seconda parte: C puro
+
+La seconda parte, che è opzionale, è codice C puro. Le funzioni contenute in
+questa sezione *NON* saranno accessibili da Perl.
+
+In genere un'estensione XS fa da collante tra una libreria C e l'interprete Perl,
+ma non sempre è così. E' possibile implementare una estensione XS anche solo
+con funzioni XSUB (vedi dopo) e nessuna funzione C pura.
+
+In questa parte vanno dichiarati file include aggiuntivi necessari alla
+parte in C, come normale. Esempio:
+
+    #include <assert.h>
+    #include <string.h>
+    #include <stdlib.h>
+    #include <stdio.h>
+
+Le funzioni C vanno definite con una sintassi particolare, che rispecchia
+il modo in cui poi lo script "xsubpp" leggerà il codice e produrrà il file
+sorgente .c finale. Esempio:
+
+    static void
+    append_newline (SV *dest)
+    {
+        sv_catpvn(dest, "\n", 1);
+    }
+
+Il tipo dato ritornato dalla funzione è uno "static void" e va messo su una
+riga a se stante. Il resto della dichiarazione è normale.
+
+=head2 Terza parte: XSUBs
+
+Con XSUBs si intendono le subroutine e funzioni XS che saranno direttamente
+accessibili dal codice Perl. Queste funzioni possono utilizzare il codice C
+(se presente) definito nella sezione precedente, cioè possono ad esempio
+chiamare funzioni definite nella parte C pura.
+
+La parte difficile di XS è qui, perché queste funzioni non sono semplice
+codice C. Contengono infatti diverse "direttive XS" e macro che sono necessarie
+all'inteprete ad esempio per manipolare correttamente il Perl Stack.
+
+La sezione XSUB inizia con la seguente dichiarazione:
+
+    MODULE = MyModule::XS		PACKAGE = MyModule::XS
+
+    PROTOTYPES: ENABLE
+
+La direttiva "PROTOTYPES" indica all'interprete se i prototipi delle
+XSUB devono essere controllati oppure no.
+A seguire, un esempio di XSUB molto semplice:
+
+    SV*
+    toStringXS (SV *scalar)
+        CODE:
+            SV *result = newSV(32);
+            sv_setpv(result, "");
+            SvPOK_only(result);
+            encode_sv(result, scalar);
+            RETVAL = result;
+        OUTPUT:
+            RETVAL
+
+Come nella sezione C, il tipo ritornato dalla XSUB deve essere specificato
+su una riga a se', senza altre informazioni.
+
+In questo caso, ci sono due direttive, "CODE:" e "OUTPUT:".
+Per il significato di queste direttive, vedere nei riferimenti
+la documentazione relativa a "perlxstut" e "perlxs".
+
+Vediamo in dettaglio cosa fa questa XSUB.
+
+  SV *result = newSV(32);
+
+Crea un nuovo scalare allocando 32 byte di memoria.
+
+  sv_setpv(result, "");
+
+Imposta il puntatore interno char* relativo ad uno scalare di tipo stringa
+a nullo, impostando implicitamente il tipo di scalare a SVPV.
+
+  SvPOK_only(result);
+
+Questa macro "dichiara" lo scalare come valido solo in contesto stringa.
+Tutti gli altri contesti (intero, float e unsigned) sono ignorati.
+
+  encode_sv(result, scalar);
+
+Questa è una chiamata ad una funzione definita nella parte C pura.
+
+  RETVAL = result
+
+"RETVAL" è una macro speciale che denota il valore di ritorno di una
+XSUB. In questo caso stiamo assegnando lo scalare (SV*) result a RETVAL.
+
+  OUTPUT:
+     RETVAL
+
+Qui indichiamo al preprocessore (xsubpp) che il valore di RETVAL, assegnato
+in precedenza deve essere considerato l'unico valore di ritorno.
+Questo produce il codice necessario a mettere "RETVAL" (e quindi "result")
+sullo stack Perl, in modo che il chiamante, presumibilmente una subroutine
+Perl, possa prelevarlo.
+
+Il passaggio di parametri e valori di ritorno tra subroutine avviene
+sempre sullo stack. Ricordo che stiamo parlando di stack Perl, non di
+stack del processore.
+
+=head1 Chiamata a funzione Perl da XS
+
+Chiamare una funzione o metodo Perl da XS è uno dei compiti più difficili
+perché implica una serie di conoscenze a basso livello che non è facile
+acquisire senza esaminare in dettaglio i sorgenti e il funzionamento dell'
+interprete Perl, magari con un debugger.
+
+=head2 Esempio
+
+Vediamo il codice (semplificato):
+        
+    GV *my_func = gv_fetchmethod ("MyPerlPackage", "my_perl_func");
+    if (my_func) {
+        dSP;
+        SV *res_sv;
+        ENTER; SAVETMPS;
+   
+        PUSHMARK (SP);
+        XPUSHs (sv_2mortal (newRV_inc (arg)));
+        PUTBACK;
+   
+        call_sv ((SV *)GvCV (my_func), G_SCALAR);
+        SPAGAIN;
+   
+        res_sv = POPs;
+        PUTBACK;
+   
+        do_something_with(res_sv);
+   
+        FREETMPS;
+        LEAVE;
+    }
+
+=head3 Puntatore a funzione
+
+Ok. Pronti?
+
+    GV *my_func = gv_fetchmethod ("MyPerlPackage", "my_perl_func");
+
+GV sta per (type) Glob Value, e corrisponde grossomodo al codice Perl:
+
+    *my_func = \&MyPerlPackage::my_perl_func;
+
+=head3 Stack frame locale
+
+Proseguendo:
+
+        dSP;
+        ENTER; SAVETMPS;
+        // ... 
+        FREETMPS; LEAVE;
+
+Questa sezione, introdotta da C<dSP; ENTER; SAVETMPS;>
+e terminata da C<FREETMPS; LEAVE;> rappresenta l'apertura e chiusura
+di uno stack frame locale.
+
+L'interprete alloca uno B<scope temporaneo>,
+in cui possiamo creare e distruggere variabili, e fare "porcate" di qualsiasi
+specie, senza causare danni allo scope superiore, cioè lo scope del chiamante.
+
+Cio' equivale in Perl a scrivere:
+
+   # Scope globale
+   {
+      # Scope temporaneo
+      my $x = 0;
+      # ...
+   }
+   # Scope globale
+
+In questo caso, C<$x> non avrà più validità al di fuori del blocco.
+Stessa cosa succede alle variabili definite tra C<dSP> e C<LEAVE>.
+
+=head3 Passaggio di parametri
+
+Per passare parametri alla funzione che stiamo per chiamare, li dobbiamo
+"pushare" sul Perl stack e dobbiamo anche far capire all'interprete quanti
+argomenti stiamo passando. Per fare questo, ci sono tre macro apposite,
+C<PUSHMARK>, C<PUTBACK>, e C<XPUSHs>. Le prime due marcano l'inizio e fine dei nostri
+parametri alla funzione seguente. La terza inserisce sullo stack l'argomento
+passato.
+
+        PUSHMARK (SP);
+        XPUSHs (sv_2mortal (newRV_inc (arg)));
+        PUTBACK;
+
+Ora, che significa C<sv_2mortal (newRV_inc (arg))> ?
+
+Significa che stiamo prendendo il nostro argomento, C<arg>, creando
+un nuovo reference ad esso (C<newRV>) incrementando il reference count relativo
+(C<_inc>) e marcando questo scalare reference (SVRV) come B<mortal>.
+
+Uno scalare B<mortal> viene B<automaticamente liberato dal garbage-collector>
+non appena si esce dallo scope corrente, quindi dopo il C<FREETMPS; LEAVE;>.
+ 
+=head3 Chiamata a funzione
+
+        call_sv ((SV *)GvCV (my_func), G_SCALAR);
+        SPAGAIN;
+
+La chiamata è realizzata da C<call_sv()>, a cui viene passato il puntatore
+a funzione ricavato nel primo passaggio. Il secondo argomento di call_sv,
+C<flags>, indica diverse cose tra cui il contesto in cui la chiamata deve
+avvenire. In questo caso, contesto scalare. Un eventuale istruzione
+C<wantarray> ritornerà in questo caso un valore falso.
+
+C<SPAGAIN> serve ad aggiornare lo stack pointer locale (SP) dopo la chiamata
+a funzione.
+
+=head3 Valore di ritorno della funzione
+
+        res_sv = POPs;
+        PUTBACK;
+
+La macro C<POPs> permette di prelevare uno scalare (suffisso C<s>) dalla cima dello
+stack, dove si presume la nostra funzione lo abbia depositato.
+
+C<PUTBACK> aggiorna lo stack pointer globale dopo l'operazione di C<POP>.
+
+=head3 Chiusura dello scope
+
+        FREETMPS;
+        LEAVE;
+
+Tutte le variabili temporanee e mortal vengono eliminate.
+Viene distrutta la copia locale dello stack pointer.
+
+=head2 Operazioni di manipolazione dello stack
+
+Per maggiori dettagli sul funzionamento delle macro relative
+allo stack, come C<SPAGAIN>, C<PUSHMARK>, C<PUTBACK>, C<XPUSHs> e C<POPs>,
+vedere:
+
+  http://perldoc.perl.org/perlguts.html#XSUBs-and-the-Argument-Stack
+  http://perldoc.perl.org/perlguts.html#Calling-Perl-Routines-from-within-C-Programs
+  http://perldoc.perl.org/perlcall.html
+
+=head1 Riferimenti
+
+Tutto ciò che non è spiegato qui per brevità, e molto di più, si può
+trovare nella ampia e perfettamente mantenuta documentazione del Perl,
+nonché su alcuni siti esterni che però sono o molto vecchi, oppure
+non più mantenuti.
+
+=head2 Documentazione Perl su XS e API interna
+
+  http://perldoc.perl.org/perlxstut.html
+  http://perldoc.perl.org/perlxs.html
+  http://perldoc.perl.org/perlapi.html
+  http://perldoc.perl.org/perlguts.html
+  http://perldoc.perl.org/perlguts.html#XSUBs-and-the-Argument-Stack
+  http://perldoc.perl.org/perlcall.html
+
+=head2 XS Mechanics. Un'introduzione "gentile" ad XS.
+
+  http://world.std.com/~swmcd/steven/perl/pm/xs/intro/index.html
+
+=head2 Informazioni aggiuntive sul processo di build di un modulo XS
+
+  http://tomacorp.com/perl/xs.html
+
+=head2 Un cookbook con esempi
+
+  http://search.cpan.org/~dmr/CookBookA-19960430/CookBookA.pod
+
+=head2 Da Perl.it, gli scalari in Perl visti dall' "interno"
+
+  http://www.perl.it/blog/archives/000071.html
+
+=head2 Altro materiale "classico" sui Perl internals
+
+  http://www.perl.org/tpc/1998/Perl_Language_and_Modules/Perl%20Illustrated/
+  http://books.simon-cozens.org/index.php/Perl_5_Internals#Preliminaries
+
+=head1 Autore
+
+Cosimo Streppone, L<mailto:cosimo@cpan.org>
